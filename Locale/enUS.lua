@@ -89,6 +89,7 @@ L["Not Scanned"] = true
 L["Preparing Filters..."] = true
 L["Processing data..."] = true
 L["Ready"] = true
+L["Reason: %s (run /tsm debug view_log for more detail)"] = true
 L["Region Avg Daily Sold:"] = true
 L["Region Avg Daily Sold x%s:"] = true
 L["Region Historical Price:"] = true

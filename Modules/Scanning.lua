@@ -221,7 +221,11 @@ function private.GetAllScanThread(self)
 			return
 		elseif event == "GETALL_BAD_DATA" then
 			-- got bad data from the server
+			local reason = unpack(args)
 			TSM:Print(L["The scan did not run successfully due to issues on Blizzard's end. Using the TSM desktop application for your scans is recommended."])
+			if reason then
+				TSM:Print(format(L["Reason: %s (run /tsm debug view_log for more detail)"], reason))
+			end
 			TSM.GUI:UpdateStatus(L["Done Scanning"], 100)
 			return
 		else
