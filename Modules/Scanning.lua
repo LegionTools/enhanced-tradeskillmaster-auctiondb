@@ -102,9 +102,9 @@ function private.FullScanThread(self)
 			if scanData[record.itemString].minBuyout == 0 or record.itemBuyout < scanData[record.itemString].minBuyout then
 				scanData[record.itemString].minBuyout = record.itemBuyout
 			end
-			for i=1, record.stackSize do
-				tinsert(scanData[record.itemString].buyouts, record.itemBuyout)
-			end
+			-- one {price, count} entry per auction instead of `stackSize` duplicate
+			-- price entries - CalculateMarketValue works off the weighted entries
+			tinsert(scanData[record.itemString].buyouts, {price=record.itemBuyout, count=record.stackSize})
 		end
 		scanData[record.itemString].numAuctions = scanData[record.itemString].numAuctions + 1
 		self:Yield()
@@ -182,9 +182,9 @@ function private.GroupScanThread(self, itemList)
 			if scanData[record.itemString].minBuyout == 0 or record.itemBuyout < scanData[record.itemString].minBuyout then
 				scanData[record.itemString].minBuyout = record.itemBuyout
 			end
-			for i=1, record.stackSize do
-				tinsert(scanData[record.itemString].buyouts, record.itemBuyout)
-			end
+			-- one {price, count} entry per auction instead of `stackSize` duplicate
+			-- price entries - CalculateMarketValue works off the weighted entries
+			tinsert(scanData[record.itemString].buyouts, {price=record.itemBuyout, count=record.stackSize})
 		end
 		scanData[record.itemString].numAuctions = scanData[record.itemString].numAuctions + 1
 		self:Yield()
@@ -289,36 +289,77 @@ function private:ProcessScanDataThread(self, scanData, itemList)
 	end
 end
 
+-- buyouts is a list of {price, count} entries (one per auction, count = stack
+-- size) rather than one entry per individual item - this keeps the input size
+-- at O(number of auctions) instead of O(number of items across all stacks).
+-- The cutoff logic below still walks unit-by-unit conceptually (always keep
+-- the single cheapest unit; after the min percentile, stop at the max
+-- percentile or at a price jump of MAX_JUMP or more), it just processes
+-- same-priced runs (an entry's units) in one step instead of one at a time.
 function private:CalculateMarketValue(buyouts)
-	local totalNum, totalBuyout = 0, 0
-	local numRecords = #buyouts
+	-- sort here (rather than relying on the caller's scan order) so this is
+	-- correct even for GetAll scans, which aren't guaranteed to come back
+	-- price-sorted the way paginated ScanQuery-based scans are
+	table.sort(buyouts, function(a, b) return a.price < b.price end)
 
-	for i=1, numRecords do
-		totalNum = i - 1
-		if i ~= 1 and i > numRecords*MIN_PERCENTILE and (i > numRecords*MAX_PERCENTILE or buyouts[i] >= MAX_JUMP*buyouts[i-1]) then
-			break
-		end
+	local totalUnits = 0
+	for _, entry in ipairs(buyouts) do
+		totalUnits = totalUnits + entry.count
+	end
+	local minPercentileUnits = totalUnits * MIN_PERCENTILE
+	local maxPercentileUnits = totalUnits * MAX_PERCENTILE
 
-		totalBuyout = totalBuyout + buyouts[i]
-		if i == numRecords then
-			totalNum = i
+	-- the single cheapest unit is always kept, regardless of percentile/jump
+	local accepted = {{price=buyouts[1].price, count=1}}
+	local totalNum, totalBuyout = 1, buyouts[1].price
+	local cumUnits = 1
+	local prevPrice = buyouts[1].price
+
+	for idx, entry in ipairs(buyouts) do
+		local price, count = entry.price, entry.count
+		-- the first entry's own first unit was already accounted for above
+		local remaining = (idx == 1) and (count - 1) or count
+		if remaining > 0 then
+			local firstUnit = cumUnits + 1
+			local lastUnit = cumUnits + remaining
+			if firstUnit > minPercentileUnits and (firstUnit > maxPercentileUnits or price >= MAX_JUMP*prevPrice) then
+				break
+			elseif lastUnit <= maxPercentileUnits then
+				-- the whole entry fits before the cutoff
+				totalBuyout = totalBuyout + price*remaining
+				totalNum = lastUnit
+				tinsert(accepted, {price=price, count=remaining})
+				cumUnits = lastUnit
+				prevPrice = price
+			else
+				-- the max-percentile cutoff falls inside this entry
+				local included = floor(maxPercentileUnits) - cumUnits
+				if included > 0 then
+					totalBuyout = totalBuyout + price*included
+					totalNum = cumUnits + included
+					tinsert(accepted, {price=price, count=included})
+				end
+				break
+			end
+		else
+			prevPrice = price
 		end
 	end
 
 	local uncorrectedMean = totalBuyout / totalNum
 	local varience = 0
 
-	for i=1, totalNum do
-		varience = varience + (buyouts[i]-uncorrectedMean)^2
+	for _, entry in ipairs(accepted) do
+		varience = varience + entry.count*(entry.price-uncorrectedMean)^2
 	end
 
 	local stdDev = sqrt(varience/totalNum)
 	local correctedTotalNum, correctedTotalBuyout = 1, uncorrectedMean
 
-	for i=1, totalNum do
-		if abs(uncorrectedMean - buyouts[i]) < 1.5*stdDev then
-			correctedTotalNum = correctedTotalNum + 1
-			correctedTotalBuyout = correctedTotalBuyout + buyouts[i]
+	for _, entry in ipairs(accepted) do
+		if abs(uncorrectedMean - entry.price) < 1.5*stdDev then
+			correctedTotalNum = correctedTotalNum + entry.count
+			correctedTotalBuyout = correctedTotalBuyout + entry.price*entry.count
 		end
 	end
 
